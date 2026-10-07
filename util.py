@@ -1,112 +1,236 @@
-# testing/util.py
-# Copyright (C) 2005-2019 the SQLAlchemy authors and contributors
-# <see AUTHORS file>
-#
-# This module is part of SQLAlchemy and is released under
-# the MIT License: http://www.opensource.org/licenses/mit-license.php
+# mypy: allow-untyped-defs, allow-incomplete-defs, allow-untyped-calls
+# mypy: no-warn-return-any, allow-any-generics
 from __future__ import annotations
 
-import types
+from collections.abc import Collection
+from typing import Any
+from typing import TYPE_CHECKING
 
-from sqlalchemy.testing.engines import testing_engine as _testing_engine
-from sqlalchemy.util import inspect_getfullargspec
+from sqlalchemy.sql.elements import conv
 
-testing_engine = _testing_engine
+if TYPE_CHECKING:
+    from sqlalchemy import Table
+    from sqlalchemy.engine import Inspector
+    from sqlalchemy.engine.interfaces import ReflectedCheckConstraint
+    from sqlalchemy.engine.interfaces import ReflectedForeignKeyConstraint
+    from sqlalchemy.engine.interfaces import ReflectedIndex
+    from sqlalchemy.engine.interfaces import ReflectedUniqueConstraint
+    from sqlalchemy.engine.reflection import _ReflectionInfo
+
+_INSP_KEYS = (
+    "columns",
+    "pk_constraint",
+    "foreign_keys",
+    "indexes",
+    "unique_constraints",
+    "table_comment",
+    "check_constraints",
+    "table_options",
+)
+_CONSTRAINT_INSP_KEYS = (
+    "pk_constraint",
+    "foreign_keys",
+    "indexes",
+    "unique_constraints",
+    "check_constraints",
+)
 
 
-def flag_combinations(*combinations):
-    """A facade around @testing.combinations() oriented towards boolean
-    keyword-based arguments.
+class _InspectorConv:
+    __slots__ = ("inspector",)
 
-    Basically generates a nice looking identifier based on the keywords
-    and also sets up the argument names.
+    def __init__(self, inspector: Inspector):
+        self.inspector = inspector
 
-    E.g.::
+    def _pre_cache(
+        self,
+        schema: str | None,
+        tablenames: list[str],
+        all_available_tablenames: Collection[str],
+        info_key: str,
+        inspector_method: Any,
+    ) -> None:
 
-        @testing.flag_combinations(
-            dict(lazy=False, passive=False),
-            dict(lazy=True, passive=False),
-            dict(lazy=False, passive=True),
-            dict(lazy=False, passive=True, raiseload=True),
+        if info_key in self.inspector.info_cache:
+            return
+
+        # heuristic vendored from SQLAlchemy 2.0
+        # if more than 50% of the tables in the db are in filter_names load all
+        # the tables, since it's most likely faster to avoid a filter on that
+        # many tables. also if a dialect doesnt have a "multi" method then
+        # return the filter names
+        if tablenames and all_available_tablenames and len(tablenames) > 100:
+            fraction = len(tablenames) / len(all_available_tablenames)
+        else:
+            fraction = None
+
+        if (
+            fraction is None
+            or fraction <= 0.5
+            or not self.inspector.dialect._overrides_default(
+                inspector_method.__name__
+            )
+        ):
+            optimized_filter_names = tablenames
+        else:
+            optimized_filter_names = None
+
+        try:
+            elements = inspector_method(
+                schema=schema, filter_names=optimized_filter_names
+            )
+        except NotImplementedError:
+            self.inspector.info_cache[info_key] = NotImplementedError
+        else:
+            self.inspector.info_cache[info_key] = elements
+
+    def _return_from_cache(
+        self,
+        tname: str,
+        schema: str | None,
+        info_key: str,
+        inspector_method: Any,
+        apply_constraint_conv: bool = False,
+        optional=True,
+    ) -> Any:
+        not_in_cache = object()
+
+        if info_key in self.inspector.info_cache:
+            cache = self.inspector.info_cache[info_key]
+            if cache is NotImplementedError:
+                if optional:
+                    return {}
+                else:
+                    # maintain NotImplementedError as alembic compare
+                    # uses these to determine classes of construct that it
+                    # should not compare to DB elements
+                    raise NotImplementedError()
+
+            individual = cache.get((schema, tname), not_in_cache)
+
+            if individual is not not_in_cache:
+                if apply_constraint_conv and individual is not None:
+                    return self._apply_reflectinfo_conv(individual)
+                else:
+                    return individual
+
+        try:
+            data = inspector_method(tname, schema=schema)
+        except NotImplementedError:
+            if optional:
+                return {}
+            else:
+                raise
+
+        if apply_constraint_conv:
+            return self._apply_reflectinfo_conv(data)
+        else:
+            return data
+
+    def get_unique_constraints(
+        self, tname: str, schema: str | None
+    ) -> list[ReflectedUniqueConstraint]:
+        return self._return_from_cache(
+            tname,
+            schema,
+            "alembic_unique_constraints",
+            self.inspector.get_unique_constraints,
+            apply_constraint_conv=True,
+            optional=False,
         )
 
-
-    would result in::
-
-        @testing.combinations(
-            ('', False, False, False),
-            ('lazy', True, False, False),
-            ('lazy_passive', True, True, False),
-            ('lazy_passive', True, True, True),
-            id_='iaaa',
-            argnames='lazy,passive,raiseload'
+    def get_indexes(
+        self, tname: str, schema: str | None
+    ) -> list[ReflectedIndex]:
+        return self._return_from_cache(
+            tname,
+            schema,
+            "alembic_indexes",
+            self.inspector.get_indexes,
+            apply_constraint_conv=True,
+            optional=False,
         )
 
-    """
-    from sqlalchemy.testing import config
+    def get_foreign_keys(
+        self, tname: str, schema: str | None
+    ) -> list[ReflectedForeignKeyConstraint]:
+        return self._return_from_cache(
+            tname,
+            schema,
+            "alembic_foreign_keys",
+            self.inspector.get_foreign_keys,
+            apply_constraint_conv=True,
+        )
 
-    keys = set()
+    def get_check_constraints(
+        self, tname: str, schema: str | None
+    ) -> list[ReflectedCheckConstraint]:
+        return self._return_from_cache(
+            tname,
+            schema,
+            "alembic_check_constraints",
+            self.inspector.get_check_constraints,
+            apply_constraint_conv=True,
+            optional=False,
+        )
 
-    for d in combinations:
-        keys.update(d)
+    def _apply_reflectinfo_conv(self, consts):
+        if not consts:
+            return consts
+        for const in consts if not isinstance(consts, dict) else [consts]:
+            if const["name"] is not None and not isinstance(
+                const["name"], conv
+            ):
+                const["name"] = conv(const["name"])
+        return consts
 
-    keys = sorted(keys)
+    def pre_cache_tables(
+        self,
+        schema: str | None,
+        tablenames: list[str],
+        all_available_tablenames: Collection[str],
+    ) -> None:
+        for key in _INSP_KEYS:
+            keyname = f"alembic_{key}"
+            meth = getattr(self.inspector, f"get_multi_{key}")
 
-    return config.combinations(
-        *[
-            ("_".join(k for k in keys if d.get(k, False)),)
-            + tuple(d.get(k, False) for k in keys)
-            for d in combinations
-        ],
-        id_="i" + ("a" * len(keys)),
-        argnames=",".join(keys),
-    )
+            self._pre_cache(
+                schema,
+                tablenames,
+                all_available_tablenames,
+                keyname,
+                meth,
+            )
 
+    def _make_reflection_info(
+        self, tname: str, schema: str | None
+    ) -> _ReflectionInfo:
+        from sqlalchemy.engine.reflection import _ReflectionInfo
 
-def resolve_lambda(__fn, **kw):
-    """Given a no-arg lambda and a namespace, return a new lambda that
-    has all the values filled in.
+        table_key = (schema, tname)
 
-    This is used so that we can have module-level fixtures that
-    refer to instance-level variables using lambdas.
+        return _ReflectionInfo(
+            unreflectable={},
+            **{
+                key: {
+                    table_key: self._return_from_cache(
+                        tname,
+                        schema,
+                        f"alembic_{key}",
+                        getattr(self.inspector, f"get_{key}"),
+                        apply_constraint_conv=(key in _CONSTRAINT_INSP_KEYS),
+                    )
+                }
+                for key in _INSP_KEYS
+            },
+        )
 
-    """
+    def reflect_table(self, table: Table) -> None:
+        ri = self._make_reflection_info(table.name, table.schema)
 
-    pos_args = inspect_getfullargspec(__fn)[0]
-    pass_pos_args = {arg: kw.pop(arg) for arg in pos_args}
-    glb = dict(__fn.__globals__)
-    glb.update(kw)
-    new_fn = types.FunctionType(__fn.__code__, glb)
-    return new_fn(**pass_pos_args)
-
-
-def metadata_fixture(ddl="function"):
-    """Provide MetaData for a pytest fixture."""
-
-    from sqlalchemy.testing import config
-    from . import fixture_functions
-
-    def decorate(fn):
-        def run_ddl(self):
-            from sqlalchemy import schema
-
-            metadata = self.metadata = schema.MetaData()
-            try:
-                result = fn(self, metadata)
-                metadata.create_all(config.db)
-                # TODO:
-                # somehow get a per-function dml erase fixture here
-                yield result
-            finally:
-                metadata.drop_all(config.db)
-
-        return fixture_functions.fixture(scope=ddl)(run_ddl)
-
-    return decorate
-
-
-def _safe_int(value: str) -> int | str:
-    try:
-        return int(value)
-    except:
-        return value
+        self.inspector.reflect_table(
+            table,
+            include_columns=None,
+            resolve_fks=False,
+            _reflect_info=ri,
+        )
